@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
+#include <Keyboard.h>
+#include <LittleFS.h>
 
 // Set to 1 to run LED/button/PIR tests once at startup (Serial at 115200)
 #define ENABLE_STARTUP_TESTS 0
@@ -10,13 +12,13 @@
 //   Digital: D0=26, D1=27, D2=28, D3=29, D4=6, D5=7, D6=0, D7=1, D8=2, D9=4, D10=3
 
 // PIR sensor on GPIO 2 (was D8 on header; wire PIR OUT to that pin)
-const int PIR_PIN = 2;
+const int PIR_PIN = D2;
 
 // Reminder LED: use onboard red (PIN_LED_R) or external on D1
 const int LED_PIN = PIN_LED_R;
 
 // Blue LED on header: now on D6 (GPIO 0) since GPIO 2 is used for PIR
-const int LED_BLUE_PIN = D6;  // P0 on header
+const int LED_BLUE_PIN = D8;  // P0 on header
 
 // Buttons: one side to pin, other side to GND. Use internal PULLUP so pin is HIGH when
 // not pressed and goes LOW when pressed (active LOW). D3=29, D4=6 (D4 is also I2C SDA).
@@ -38,12 +40,17 @@ const uint8_t CONFIG_ONBOARD_G = 128;
 const uint8_t CONFIG_ONBOARD_B = 255;
 
 // Timing
-// const unsigned long REMINDER_INTERVAL_MS = 20UL * 60 * 1000;  // 20 min
-const unsigned long REMINDER_INTERVAL_MS = 1000;  // 1 min
-const unsigned long AWAY_TIMEOUT_MS = 10UL * 60 * 1000;       // 10 min
+const unsigned long REMINDER_INTERVAL_MS = 20UL * 60 * 1000;  // 20 min
+const unsigned long AWAY_TIMEOUT_MS = 15UL * 60 * 1000;       // 15 min
 const unsigned long DEBOUNCE_MS = 200;
 // NeoPixel reminder: one full soft green cycle (fade in + fade out) in ms
 const unsigned long REMINDER_NEOPIXEL_CYCLE_MS = 2500;
+
+// Macro string: loaded from LittleFS "/macro.txt" at startup, or use this default. Button 2 types it via USB HID.
+#define MACRO_STRING_MAX 256
+#define MACRO_FILE_PATH  "/macro.txt"
+static const char MACRO_DEFAULT[] = "Hello from desk!";  // used if file missing or empty
+static char macroString[MACRO_STRING_MAX];
 
 // Volatile: updated in ISRs
 volatile unsigned long lastPersonSeen = 0;
@@ -58,11 +65,6 @@ unsigned long lastButton2Press = 0;
 unsigned long lastPIRProcessedAt = 0;
 bool lastClearWasLow = false;
 bool lastBtn2WasLow = false;
-// PIR: alternate blue LED on/off each trigger
-bool blueLedOn = false;
-// Button 1 = onboard blue off, Button 2 = onboard red off (overrides config until next change)
-bool onboardBlueOff = false;
-bool onboardRedOff = false;
 
 // NeoPixel object (1 pixel)
 static Adafruit_NeoPixel neopixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
@@ -94,13 +96,55 @@ void onButton2() {
   button2Pressed = true;
 }
 
-// Apply configurable LED state: blue LED from PIR toggle; onboard RGB via setOnboardRgbColor.
+// Load macro string from LittleFS MACRO_FILE_PATH; on failure or empty, use MACRO_DEFAULT.
+static void loadMacroString() {
+  macroString[0] = '\0';
+  if (!LittleFS.begin()) {
+    strncpy(macroString, MACRO_DEFAULT, MACRO_STRING_MAX - 1);
+    macroString[MACRO_STRING_MAX - 1] = '\0';
+    Serial.println("LittleFS not mounted, using default macro");
+    return;
+  }
+  File f = LittleFS.open(MACRO_FILE_PATH, "r");
+  if (!f || f.isDirectory()) {
+    strncpy(macroString, MACRO_DEFAULT, MACRO_STRING_MAX - 1);
+    macroString[MACRO_STRING_MAX - 1] = '\0';
+    Serial.println("No macro file, using default");
+    if (f) f.close();
+    return;
+  }
+  size_t n = f.read((uint8_t*)macroString, MACRO_STRING_MAX - 1);
+  f.close();
+  if (n == 0) {
+    strncpy(macroString, MACRO_DEFAULT, MACRO_STRING_MAX - 1);
+    macroString[MACRO_STRING_MAX - 1] = '\0';
+  } else {
+    macroString[n] = '\0';
+    // trim trailing newline/cr if present
+    while (n > 0 && (macroString[n - 1] == '\n' || macroString[n - 1] == '\r')) {
+      macroString[--n] = '\0';
+    }
+    Serial.print("Macro loaded from file (");
+    Serial.print(n);
+    Serial.println(" chars)");
+  }
+}
+
+// Type the macro string as USB HID keyboard (character by character with short delay).
+static void sendMacroString() {
+  if (macroString[0] == '\0') return;
+  for (size_t i = 0; macroString[i] != '\0' && i < MACRO_STRING_MAX; i++) {
+    if (macroString[i] != '\r')
+      Keyboard.write((uint8_t)macroString[i]);
+    delay(15);
+  }
+  Serial.println("Macro sent");
+}
+
+// No lights until reminder: keep blue and onboard RGB off. Only the reminder block turns on the green NeoPixel.
 void applyLedState() {
-  analogWrite(LED_BLUE_PIN, blueLedOn ? CONFIG_BLUE_LED_ON : 0);
-  uint8_t r = onboardRedOff ? 0 : CONFIG_ONBOARD_R;
-  uint8_t g = CONFIG_ONBOARD_G;
-  uint8_t b = onboardBlueOff ? 0 : CONFIG_ONBOARD_B;
-  setOnboardRgbColor(r, g, b);
+  analogWrite(LED_BLUE_PIN, 0);
+  setOnboardRgbColor(0, 0, 0);
 }
 
 #if ENABLE_STARTUP_TESTS
@@ -109,36 +153,31 @@ static void runStartupTests() {
   Serial.println("=== Startup tests (LEDs, buttons, PIR) ===");
 
   // --- LED test: cycle each output ---
-  Serial.println("LED test: Onboard R (PIN_LED_R=17)");
-  digitalWrite(PIN_LED_R, HIGH);
+  Serial.println("LED test: Onboard R (active-LOW)");
+  setOnboardRgbColor(255, 0, 0);
   delay(400);
-  digitalWrite(PIN_LED_R, LOW);
+  setOnboardRgbColor(0, 0, 0);
   delay(200);
 
-  Serial.println("LED test: Onboard G (PIN_LED_G=16)");
-  digitalWrite(PIN_LED_G, HIGH);
+  Serial.println("LED test: Onboard G (active-LOW)");
+  setOnboardRgbColor(0, 255, 0);
   delay(400);
-  digitalWrite(PIN_LED_G, LOW);
+  setOnboardRgbColor(0, 0, 0);
   delay(200);
 
-  Serial.println("LED test: Onboard B (PIN_LED_B=25)");
-  digitalWrite(PIN_LED_B, HIGH);
+  Serial.println("LED test: Onboard B (active-LOW)");
+  setOnboardRgbColor(0, 0, 255);
   delay(400);
-  digitalWrite(PIN_LED_B, LOW);
+  setOnboardRgbColor(0, 0, 0);
   delay(200);
 
   Serial.println("LED test: NeoPixel (power=11, data=12) - 1 pixel, red");
   pinMode(NEOPIXEL_POWER, OUTPUT);
-  digitalWrite(NEOPIXEL_POWER, HIGH);  // Must be HIGH to power the NeoPixel
+  digitalWrite(NEOPIXEL_POWER, HIGH);
   delay(50);
-  Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
-  pixel.begin();
-  pixel.setBrightness(80);
-  pixel.setPixelColor(0, pixel.Color(255, 0, 0));
-  pixel.show();
+  setNeoPixelColor(255, 0, 0, 80);
   delay(1200);
-  pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-  pixel.show();
+  setNeoPixelColor(0, 0, 0);
   digitalWrite(NEOPIXEL_POWER, LOW);
   delay(200);
 
@@ -172,18 +211,18 @@ static void runStartupTests() {
       clearButtonPressed = false;
       lastClearButtonPress = millis();
       Serial.println("  -> D3 (clear) pressed -> lighting RED");
-      digitalWrite(PIN_LED_R, HIGH);
+      setOnboardRgbColor(255, 0, 0);
       delay(300);
-      digitalWrite(PIN_LED_R, LOW);
+      setOnboardRgbColor(0, 0, 0);
     }
     if (d4Low && (millis() - lastD4 >= DEBOUNCE_MS)) {
       lastD4 = millis();
       button2Pressed = false;
       lastButton2Press = millis();
       Serial.println("  -> D4 (button2) pressed -> lighting GREEN");
-      digitalWrite(PIN_LED_G, HIGH);
+      setOnboardRgbColor(0, 255, 0);
       delay(300);
-      digitalWrite(PIN_LED_G, LOW);
+      setOnboardRgbColor(0, 0, 0);
     }
     // Also handle interrupt flags in case they fire
     if (clearButtonPressed && (millis() - lastClearButtonPress >= DEBOUNCE_MS)) {
@@ -191,18 +230,18 @@ static void runStartupTests() {
       lastClearButtonPress = millis();
       lastD3 = millis();
       Serial.println("  -> D3 (clear) pressed [IRQ] -> lighting RED");
-      digitalWrite(PIN_LED_R, HIGH);
+      setOnboardRgbColor(255, 0, 0);
       delay(300);
-      digitalWrite(PIN_LED_R, LOW);
+      setOnboardRgbColor(0, 0, 0);
     }
     if (button2Pressed && (millis() - lastButton2Press >= DEBOUNCE_MS)) {
       button2Pressed = false;
       lastButton2Press = millis();
       lastD4 = millis();
       Serial.println("  -> D4 (button2) pressed [IRQ] -> lighting GREEN");
-      digitalWrite(PIN_LED_G, HIGH);
+      setOnboardRgbColor(0, 255, 0);
       delay(300);
-      digitalWrite(PIN_LED_G, LOW);
+      setOnboardRgbColor(0, 0, 0);
     }
     delay(20);
   }
@@ -218,9 +257,9 @@ static void runStartupTests() {
       pirTriggered = false;
       pirSeen = true;
       Serial.println("  -> PIR triggered! Lighting BLUE briefly.");
-      digitalWrite(PIN_LED_B, HIGH);
+      setOnboardRgbColor(0, 0, 255);
       delay(500);
-      digitalWrite(PIN_LED_B, LOW);
+      setOnboardRgbColor(0, 0, 0);
       break;
     }
     delay(20);
@@ -240,6 +279,9 @@ void setup() {
   while (!Serial && millis() < 3000) { }
   Serial.println("Desk Eye-Rest Timer started");
 
+  Keyboard.begin();
+  loadMacroString();
+
   pinMode(PIR_PIN, INPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(PIN_LED_R, OUTPUT);
@@ -258,11 +300,9 @@ void setup() {
 
   digitalWrite(NEOPIXEL_POWER, HIGH);  // NeoPixel power (already OUTPUT from pinMode above)
   neopixel.begin();
-  neopixel.setBrightness(100);
-  neopixel.setPixelColor(0, neopixel.Color(CONFIG_NEOPIXEL_R, CONFIG_NEOPIXEL_G, CONFIG_NEOPIXEL_B));
-  neopixel.show();
+  setNeoPixelColor(CONFIG_NEOPIXEL_R, CONFIG_NEOPIXEL_G, CONFIG_NEOPIXEL_B, 100);
 
-  applyLedState(false);
+  applyLedState();
 
   attachInterrupt(digitalPinToInterrupt(PIR_PIN), onPIR, RISING);
   attachInterrupt(digitalPinToInterrupt(CLEAR_BUTTON_PIN), onClearButton, FALLING);
@@ -275,19 +315,15 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
-  const bool reminderBlinking = (reminderDueAt != 0 && now >= reminderDueAt);
 
-  // 1. Handle PIR flag: if we were away (or first trigger), start session; alternate blue LED on/off
+  // 1. Handle PIR: when back at desk after away (or first time), start 20 min timer from 0. No lights until reminder.
   if (pirTriggered) {
     pirTriggered = false;
-    blueLedOn = !blueLedOn;
-    setNeoPixelColor(CONFIG_NEOPIXEL_R, CONFIG_NEOPIXEL_G, CONFIG_NEOPIXEL_B);
     bool wasAway = (lastPIRProcessedAt == 0) || (now - lastPIRProcessedAt > AWAY_TIMEOUT_MS);
     if (wasAway) {
       reminderDueAt = now + REMINDER_INTERVAL_MS;
-      Serial.println("PIR: person detected, 20 min timer started");
-    } else {
-      Serial.println("PIR: person detected");
+      setNeoPixelColor(0, 0, 0);
+      Serial.println("PIR: back at desk, 20 min reminder timer started");
     }
     lastPIRProcessedAt = now;
   }
@@ -300,9 +336,7 @@ void loop() {
     clearButtonPressed = false;
     lastClearButtonPress = now;
     reminderDueAt = now + REMINDER_INTERVAL_MS;
-    neopixel.setPixelColor(0, neopixel.Color(0, 0, 0));
-    neopixel.show();
-    onboardBlueOff = true;
+    setNeoPixelColor(0, 0, 0);
     Serial.println("Clear button: timer reset, reminder off");
   }
 
@@ -313,20 +347,18 @@ void loop() {
   if ((button2Pressed || btn2JustPressed) && (now - lastButton2Press >= DEBOUNCE_MS)) {
     button2Pressed = false;
     lastButton2Press = now;
-    onboardRedOff = true;
-    Serial.println("Button 2 pressed: onboard red LED off");
+    sendMacroString();
   }
 
   // 3. Away check: no PIR for 10+ min -> reminder off
   if (lastPersonSeen != 0 && (now - lastPersonSeen > AWAY_TIMEOUT_MS)) {
     if (reminderDueAt != 0) {
       reminderDueAt = 0;
-      neopixel.setPixelColor(0, neopixel.Color(0, 0, 0));
-      neopixel.show();
+      setNeoPixelColor(0, 0, 0);
       Serial.println("Away: no motion 10+ min, timer cleared");
     }
   } else if (reminderDueAt != 0 && now >= reminderDueAt) {
-    // 4. Reminder: NeoPixel soft green cycle (fade in and out)
+    // 4. Reminder: only the green NeoPixel soft-flashes
     unsigned long phase = (now - reminderDueAt) % REMINDER_NEOPIXEL_CYCLE_MS;
     unsigned long half = REMINDER_NEOPIXEL_CYCLE_MS / 2;
     uint8_t green;
@@ -334,9 +366,10 @@ void loop() {
       green = (uint8_t)((255UL * phase) / half);
     else
       green = (uint8_t)(255 - (255UL * (phase - half)) / half);
-    neopixel.setBrightness(120);
-    neopixel.setPixelColor(0, neopixel.Color(0, green, 0));
-    neopixel.show();
+    setNeoPixelColor(0, green, 0, 120);
+  } else {
+    // Before reminder or no active timer: NeoPixel off
+    setNeoPixelColor(0, 0, 0);
   }
-  applyLedState(false);
+  applyLedState();
 }
