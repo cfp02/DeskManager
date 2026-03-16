@@ -41,7 +41,7 @@ const uint8_t CONFIG_ONBOARD_B = 255;
 
 // Timing
 const unsigned long REMINDER_INTERVAL_MS = 20UL * 60 * 1000;  // 20 min
-const unsigned long AWAY_TIMEOUT_MS = 15UL * 60 * 1000;       // 15 min
+const unsigned long AWAY_TIMEOUT_MS = 4UL * 60 * 1000;       // 4 min
 const unsigned long DEBOUNCE_MS = 200;
 // NeoPixel reminder: one full soft green cycle (fade in + fade out) in ms
 const unsigned long REMINDER_NEOPIXEL_CYCLE_MS = 2500;
